@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.tox/
+.pytest_cache/
+direct-access-report.txt
+direct-access-raw.log

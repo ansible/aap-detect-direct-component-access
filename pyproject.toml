@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aap-detect-direct-component-access"
+version = "0.1.0"
+description = "Detect direct API access to AAP platform components by analyzing nginx access logs"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Ansible Automation Platform Team", email = "ansible-team@redhat.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+aap-detect-direct-component-access = "aap_detect_direct_component_access.detect:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
