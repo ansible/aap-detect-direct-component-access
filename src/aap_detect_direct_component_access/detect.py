@@ -69,6 +69,55 @@ _LEGACY_LOG_RE = re.compile(
     r'\s*$'
 )
 
+# OCP format: Kubernetes timestamp prefix + combined log format with
+# extra fields (rid=..., req_len=...) before the two trailing markers.
+# Example:
+#   2026-03-11T06:54:11.972Z 172.19.0.29 - - [11/Mar/2026:06:54:11 +0000]
+#   "GET /api/v2/jobs/ HTTP/1.1" 200 1802 "-" "python-requests/2.32.3"
+#   "172.19.0.29" rid=abc123 trusted-proxy dab-jwt
+_OCP_LOG_RE = re.compile(
+    r'^\S+'                            # k8s timestamp (e.g. 2026-03-11T06:54:11.972Z)
+    r' (\S+)'                          # remote_addr
+    r' - '
+    r'(\S+)'                           # remote_user
+    r' \[([^\]]+)\]'                   # time_local
+    r' "([^"]*)"'                      # request
+    r' (\d{3})'                        # status
+    r' (\d+|-)'                        # body_bytes_sent
+    r' "([^"]*)"'                      # http_referer
+    r' "([^"]*)"'                      # http_user_agent
+    r' "([^"]*)"'                      # http_x_forwarded_for
+    r'(?: \S+=\S+)*'                   # extra k=v fields (rid=..., req_len=...)
+    r' (\S+)'                          # trusted_proxy_present
+    r' (\S+)'                          # dab_jwt_present
+    r'\s*$'
+)
+
+# Key=value format used by AAP containerized nginx (sosreport from
+# ``sos report -k aap_containerized``).  Example line:
+#   "11/Mar/2026:10:35:20 +0000" client=3.83.224.83 x_forwarded_for=-
+#   ... request="GET /api/v2/jobs/ HTTP/1.1" ... status=200 ...
+#   user_agent="python-requests/2.32.3" ... trusted_proxy=- dab_jwt=-
+_KV_LOG_RE = re.compile(
+    r'^"([^"]+)"'                      # time_local (quoted)
+    r' client=(\S+)'                   # remote_addr (client)
+    r' x_forwarded_for=(\S+)'         # http_x_forwarded_for
+    r'.*?'
+    r' request="([^"]*)"'             # request
+    r'.*?'
+    r' status=(\d{3})'                # status
+    r'.*?'
+    r' body_bytes_sent=(\d+)'         # body_bytes_sent
+    r'.*?'
+    r' referer=(\S+|"[^"]*")'         # http_referer
+    r'.*?'
+    r' user_agent="([^"]*)"'          # http_user_agent
+    r'.*?'
+    r' trusted_proxy=(\S+)'           # trusted_proxy_present
+    r' dab_jwt=(\S+)'                 # dab_jwt_present
+    r'\s*$'
+)
+
 # ── Paths that are "expected" direct access ─────────────────────────
 
 # Health / readiness / startup probes and internal Kubernetes traffic.
@@ -90,6 +139,8 @@ _FILTERED_UA_SUBSTRINGS = (
     "kube-probe",
     "kubernetes",
     "haproxy",
+    "envoy/hc",
+    "ansible-httpget",
 )
 
 
@@ -113,11 +164,16 @@ def _detect_input_type(path):
     if not os.path.isdir(path):
         return None, {}
 
-    # SOSReport: look for var/log/containers/ or var/log/pods/
+    # SOSReport (OCP): look for var/log/containers/ or var/log/pods/
     sos_container_logs = os.path.join(path, "var", "log", "containers")
     sos_pod_logs = os.path.join(path, "var", "log", "pods")
     if os.path.isdir(sos_container_logs) or os.path.isdir(sos_pod_logs):
         return InputType.SOSREPORT, _find_sos_logs(path)
+
+    # SOSReport (containerized): look for sos_commands/aap_containerized/
+    containerized_logs = _find_containerized_sos_logs(path)
+    if containerized_logs:
+        return InputType.SOSREPORT, containerized_logs
 
     # must-gather: look for namespaces/ directory (OpenShift style)
     namespaces_dir = _find_namespaces_dir(path)
@@ -155,6 +211,30 @@ def _component_from_pod_name(pod_name):
         return "hub"
     if "eda" in pod_lower:
         return "eda"
+    if "gateway" in pod_lower:
+        return "gateway"
+    if "lightspeed" in pod_lower:
+        return "lightspeed"
+    return "unknown"
+
+
+def _component_from_container_log_name(filename):
+    """Infer component name from a containerized AAP log filename.
+
+    Handles names like ``automation-controller-web.log`` or
+    ``automationcontroller-0-automation-controller-web.log``.
+    """
+    lower = filename.lower()
+    if "controller" in lower:
+        return "controller"
+    if "hub" in lower:
+        return "hub"
+    if "eda" in lower:
+        return "eda"
+    if "gateway" in lower:
+        return "gateway"
+    if "lightspeed" in lower:
+        return "lightspeed"
     return "unknown"
 
 
@@ -173,6 +253,30 @@ def _find_sos_logs(base):
                         os.path.basename(root) if log_dir.endswith("pods") else fname
                     )
                     component_logs[comp].append(full)
+    return dict(component_logs)
+
+
+def _find_containerized_sos_logs(base):
+    """Find nginx access logs in a containerized AAP SOSReport.
+
+    Containerized sosreports place container logs under
+    ``sos_commands/aap_containerized/aap_container_logs/``.  The web
+    logs (which contain nginx access entries) are named like
+    ``automation-controller-web.log``.
+    """
+    component_logs = collections.defaultdict(list)
+
+    # Walk to find sos_commands/aap_containerized/aap_container_logs/
+    for root, dirs, files in os.walk(base):
+        if os.path.basename(root) == "aap_container_logs":
+            parent = os.path.dirname(root)
+            if os.path.basename(parent) == "aap_containerized":
+                for fname in files:
+                    if fname.endswith("-web.log") or fname.endswith("-web.log.gz"):
+                        full = os.path.join(root, fname)
+                        comp = _component_from_container_log_name(fname)
+                        component_logs[comp].append(full)
+
     return dict(component_logs)
 
 
@@ -291,6 +395,51 @@ def parse_log_lines(lines, source_label=""):
                 http_x_forwarded_for=m.group(9),
                 trusted_proxy=m.group(10),
                 dab_jwt=m.group(11),
+                raw_line=line,
+            )
+            is_direct = entry.trusted_proxy == "-" and entry.dab_jwt == "-"
+            yield entry, is_direct, True
+            continue
+
+        # OCP format (k8s timestamp + combined + extra k=v fields + markers)
+        ocp = _OCP_LOG_RE.match(line)
+        if ocp:
+            entry = LogEntry(
+                remote_addr=ocp.group(1),
+                remote_user=ocp.group(2),
+                time_local=ocp.group(3),
+                request=ocp.group(4),
+                status=ocp.group(5),
+                body_bytes_sent=ocp.group(6),
+                http_referer=ocp.group(7),
+                http_user_agent=ocp.group(8),
+                http_x_forwarded_for=ocp.group(9),
+                trusted_proxy=ocp.group(10),
+                dab_jwt=ocp.group(11),
+                raw_line=line,
+            )
+            is_direct = entry.trusted_proxy == "-" and entry.dab_jwt == "-"
+            yield entry, is_direct, True
+            continue
+
+        # Key=value format from containerized AAP sosreports
+        kv = _KV_LOG_RE.match(line)
+        if kv:
+            referer = kv.group(7)
+            if referer.startswith('"') and referer.endswith('"'):
+                referer = referer[1:-1]
+            entry = LogEntry(
+                remote_addr=kv.group(2),
+                remote_user="-",
+                time_local=kv.group(1),
+                request=kv.group(4),
+                status=kv.group(5),
+                body_bytes_sent=kv.group(6),
+                http_referer=referer,
+                http_user_agent=kv.group(8),
+                http_x_forwarded_for=kv.group(3),
+                trusted_proxy=kv.group(9),
+                dab_jwt=kv.group(10),
                 raw_line=line,
             )
             is_direct = entry.trusted_proxy == "-" and entry.dab_jwt == "-"

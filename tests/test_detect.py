@@ -19,6 +19,8 @@ from aap_detect_direct_component_access.detect import (
     LogEntry,
     _LOG_RE,
     _LEGACY_LOG_RE,
+    _KV_LOG_RE,
+    _component_from_container_log_name,
     _component_from_pod_name,
     _detect_input_type,
     _is_filtered,
@@ -85,6 +87,55 @@ class TestLogRegex(unittest.TestCase):
         self.assertEqual(m.group(11), "dab-jwt")
 
 
+class TestKVLogRegex(unittest.TestCase):
+    """Test the key=value log format regex (containerized AAP)."""
+
+    def test_kv_format_gateway(self):
+        line = (
+            '"11/Mar/2026:10:40:10 +0000" client=44.201.232.211 '
+            'x_forwarded_for=44.201.232.211 realip=- method=GET '
+            'request="GET /api/galaxy/service-index/role-permissions/ HTTP/1.1" '
+            'request_length=1930 status=200 bytes_sent=1921 body_bytes_sent=1303 '
+            'referer=- user_agent="python-requests/2.32.3" '
+            'upstream_addr=127.0.0.1:24817 upstream_status=200 '
+            'request_time=0.107 upstream_response_time=0.107 '
+            'upstream_connect_time=0.002 upstream_header_time=0.107 '
+            'request_id="560da727" trusted_proxy=trusted-proxy dab_jwt=dab-jwt'
+        )
+        m = _KV_LOG_RE.match(line)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(2), "44.201.232.211")
+        self.assertEqual(m.group(9), "trusted-proxy")
+        self.assertEqual(m.group(10), "dab-jwt")
+
+    def test_kv_format_direct(self):
+        line = (
+            '"11/Mar/2026:10:43:19 +0000" client=3.82.145.91 '
+            'x_forwarded_for=- realip=- method=POST '
+            'request="POST /api/v2/tokens/ HTTP/1.1" '
+            'request_length=342 status=201 bytes_sent=1204 body_bytes_sent=528 '
+            'referer=- user_agent="Python-urllib/3.9" '
+            'upstream_addr=127.0.0.1:8050 upstream_status=201 '
+            'request_time=0.647 upstream_response_time=0.646 '
+            'upstream_connect_time=0.000 upstream_header_time=0.646 '
+            'request_id="-" trusted_proxy=- dab_jwt=-'
+        )
+        m = _KV_LOG_RE.match(line)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(2), "3.82.145.91")
+        self.assertEqual(m.group(9), "-")
+        self.assertEqual(m.group(10), "-")
+
+    def test_kv_format_does_not_match_uwsgi(self):
+        line = (
+            '[pid: 24|app: -|req: -/-] 172.17.0.3 (-) {50 vars in 911 bytes} '
+            '[Wed Mar 11 10:59:46 2026] POST /api/v2/job_templates/47/launch/ '
+            '=> generated 3453 bytes in 169 msecs (HTTP/1.1 201)'
+        )
+        m = _KV_LOG_RE.match(line)
+        self.assertIsNone(m)
+
+
 class TestParseLogLines(unittest.TestCase):
     """Test parse_log_lines generator."""
 
@@ -113,6 +164,31 @@ class TestParseLogLines(unittest.TestCase):
         _entry, is_direct, fmt_ok = results[0]
         self.assertFalse(is_direct)
         self.assertFalse(fmt_ok)
+
+    def test_kv_format_classification(self):
+        lines = [
+            '"11/Mar/2026:10:40:10 +0000" client=44.201.232.211 x_forwarded_for=44.201.232.211 realip=- method=GET request="GET /api/v2/jobs/ HTTP/1.1" request_length=100 status=200 bytes_sent=500 body_bytes_sent=300 referer=- user_agent="python-requests/2.32.3" upstream_addr=127.0.0.1:8050 upstream_status=200 request_time=0.1 upstream_response_time=0.1 upstream_connect_time=0.001 upstream_header_time=0.1 request_id="abc" trusted_proxy=trusted-proxy dab_jwt=dab-jwt\n',
+            '"11/Mar/2026:10:43:19 +0000" client=3.82.145.91 x_forwarded_for=- realip=- method=POST request="POST /api/v2/tokens/ HTTP/1.1" request_length=342 status=201 bytes_sent=1204 body_bytes_sent=528 referer=- user_agent="Python-urllib/3.9" upstream_addr=127.0.0.1:8050 upstream_status=201 request_time=0.647 upstream_response_time=0.646 upstream_connect_time=0.000 upstream_header_time=0.646 request_id="-" trusted_proxy=- dab_jwt=-\n',
+        ]
+        results = list(parse_log_lines(lines))
+        self.assertEqual(len(results), 2)
+
+        entry1, is_direct1, fmt_ok1 = results[0]
+        self.assertFalse(is_direct1)
+        self.assertTrue(fmt_ok1)
+        self.assertEqual(entry1.remote_addr, "44.201.232.211")
+
+        entry2, is_direct2, fmt_ok2 = results[1]
+        self.assertTrue(is_direct2)
+        self.assertTrue(fmt_ok2)
+        self.assertEqual(entry2.remote_addr, "3.82.145.91")
+
+    def test_kv_format_uwsgi_lines_skipped(self):
+        lines = [
+            '[pid: 24|app: -|req: -/-] 172.17.0.3 (-) {50 vars} [Wed Mar 11 10:59:46 2026] POST /api/ => generated 3453 bytes\n',
+        ]
+        results = list(parse_log_lines(lines))
+        self.assertEqual(len(results), 0)
 
     def test_empty_lines_skipped(self):
         lines = ["", "\n", "   \n"]
@@ -193,8 +269,30 @@ class TestComponentDetection(unittest.TestCase):
     def test_eda(self):
         self.assertEqual(_component_from_pod_name("my-aap-eda-api-abc123"), "eda")
 
+    def test_gateway(self):
+        self.assertEqual(_component_from_pod_name("my-aap-gateway-abc123"), "gateway")
+
     def test_unknown(self):
         self.assertEqual(_component_from_pod_name("redis-abc123"), "unknown")
+
+
+class TestContainerLogNameDetection(unittest.TestCase):
+    """Test component name inference from containerized log filenames."""
+
+    def test_controller_web(self):
+        self.assertEqual(_component_from_container_log_name("automation-controller-web.log"), "controller")
+
+    def test_hub_web(self):
+        self.assertEqual(_component_from_container_log_name("automation-hub-web.log"), "hub")
+
+    def test_eda_web(self):
+        self.assertEqual(_component_from_container_log_name("automation-eda-web.log"), "eda")
+
+    def test_gateway(self):
+        self.assertEqual(_component_from_container_log_name("automation-gateway-proxy.log"), "gateway")
+
+    def test_unknown(self):
+        self.assertEqual(_component_from_container_log_name("redis-tcp.log"), "unknown")
 
 
 class TestAnalyze(unittest.TestCase):
@@ -246,6 +344,19 @@ class TestAnalyze(unittest.TestCase):
         self.assertEqual(report.direct_access_count, 6)
         self.assertEqual(report.filtered_count, 0)
 
+    def test_kv_format_file(self):
+        log_path = os.path.join(FIXTURES, "sample_kv_format.log")
+        reports, errors = analyze(log_path)
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(len(reports), 1)
+        report = reports[0]
+        # 7 lines: 1 gateway, 1 Envoy/HC (filtered), 1 direct (tokens),
+        # 1 filtered (ping), 1 ansible-httpget (filtered),
+        # 1 uwsgi (skipped), 1 direct (jobs)
+        self.assertEqual(report.total_requests, 6)  # uwsgi line skipped
+        self.assertEqual(report.direct_access_count, 2)
+        self.assertEqual(report.filtered_count, 3)  # Envoy/HC + ping + ansible-httpget
+
     def test_nonexistent_path(self):
         reports, errors = analyze("/nonexistent/path/to/logs")
         self.assertTrue(len(errors) > 0)
@@ -284,6 +395,25 @@ class TestInputDetection(unittest.TestCase):
             f.write("test\n")
         input_type, logs = _detect_input_type(self.tmpdir)
         self.assertEqual(input_type, InputType.MUST_GATHER)
+        self.assertIn("controller", logs)
+
+    def test_containerized_sosreport(self):
+        """Containerized AAP sosreport with aap_container_logs."""
+        log_dir = os.path.join(self.tmpdir, "sos_commands",
+                               "aap_containerized", "aap_container_logs")
+        os.makedirs(log_dir)
+        with open(os.path.join(log_dir, "automation-controller-web.log"), "w") as f:
+            f.write('"11/Mar/2026:10:43:19 +0000" client=10.0.0.1 '
+                    'x_forwarded_for=- realip=- method=GET '
+                    'request="GET /api/v2/jobs/ HTTP/1.1" '
+                    'request_length=100 status=200 bytes_sent=500 body_bytes_sent=300 '
+                    'referer=- user_agent="curl/7.68.0" '
+                    'upstream_addr=127.0.0.1:8050 upstream_status=200 '
+                    'request_time=0.1 upstream_response_time=0.1 '
+                    'upstream_connect_time=0.001 upstream_header_time=0.1 '
+                    'request_id="-" trusted_proxy=- dab_jwt=-\n')
+        input_type, logs = _detect_input_type(self.tmpdir)
+        self.assertEqual(input_type, InputType.SOSREPORT)
         self.assertIn("controller", logs)
 
     def test_must_gather_nested(self):
