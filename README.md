@@ -17,13 +17,13 @@ without the `X-Trusted-Proxy` header and without a DAB JWT token.
 ### With uvx (recommended, no install needed)
 
 ```bash
-uvx aap-detect-direct-component-access /path/to/sosreport
+uvx --from "git+https://github.com/ansible/aap-detect-direct-component-access" aap-detect-direct-component-access /path/to/sosreport
 ```
 
 ### With pip
 
 ```bash
-pip install aap-detect-direct-component-access
+pip install "git+https://github.com/ansible/aap-detect-direct-component-access"
 aap-detect-direct-component-access /path/to/sosreport
 ```
 

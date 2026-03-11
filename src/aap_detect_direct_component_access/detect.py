@@ -623,7 +623,6 @@ def write_raw_log(reports, output_path):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="aap-detect-direct-component-access",
         description="Detect direct API access to AAP platform components "
                     "by analyzing nginx access logs.",
     )
@@ -646,7 +645,7 @@ def build_parser():
     parser.add_argument(
         "-V", "--version",
         action="version",
-        version="%%(prog)s %s" % __version__,
+        version="%(prog)s " + __version__,
     )
     return parser
 
