@@ -78,8 +78,8 @@ will report them as "legacy format" and exit with code 3.
 ### Output
 
 1. **stdout** — summary with total requests, direct access count per component
-2. **direct-access-report.txt** — detailed breakdown by path and source IP
-3. **direct-access-raw.log** — raw nginx log lines flagged as direct access
+2. **`<input-name>.report.txt`** — detailed breakdown by path and source IP
+3. **`<input-name>.raw.log`** — raw nginx log lines flagged as direct access
 
 ### Exit codes
 

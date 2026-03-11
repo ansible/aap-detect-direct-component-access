@@ -675,9 +675,15 @@ def main(argv=None):
 
     print_summary(reports, errors, input_type)
 
-    # Write output files
-    report_path = os.path.join(output_dir, "direct-access-report.txt")
-    raw_path = os.path.join(output_dir, "direct-access-raw.log")
+    # Write output files — named after the input
+    input_basename = os.path.basename(input_path.rstrip(os.sep))
+    # Strip common archive/log extensions to get a clean stem
+    for ext in (".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".gz", ".log"):
+        if input_basename.endswith(ext):
+            input_basename = input_basename[:-len(ext)]
+            break
+    report_path = os.path.join(output_dir, "%s.report.txt" % input_basename)
+    raw_path = os.path.join(output_dir, "%s.raw.log" % input_basename)
 
     write_detailed_report(reports, report_path)
     write_raw_log(reports, raw_path)
