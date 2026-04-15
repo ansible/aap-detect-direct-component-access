@@ -25,9 +25,13 @@ import collections
 import glob
 import gzip
 import io
+import json
 import os
 import re
+import shutil
 import sys
+import tarfile
+import tempfile
 
 __version__ = "0.1.0"
 
@@ -48,6 +52,7 @@ _LOG_RE = re.compile(
     r' "([^"]*)"'                      # http_referer
     r' "([^"]*)"'                      # http_user_agent
     r' "([^"]*)"'                      # http_x_forwarded_for
+    r'(?: [^\s=]+=\S+)*'               # optional k=v fields (e.g. rid=...)
     r' (\S+)'                          # trusted_proxy_present
     r' (\S+)'                          # dab_jwt_present
     r'\s*$'
@@ -132,6 +137,7 @@ _FILTERED_PATH_PREFIXES = (
     "/nginx_status",
     "/static/",
     "/favicon.ico",
+    "/websocket/relay/",
 )
 
 # User-agent substrings that indicate internal probes (case-insensitive).
@@ -141,6 +147,7 @@ _FILTERED_UA_SUBSTRINGS = (
     "haproxy",
     "envoy/hc",
     "ansible-httpget",
+    "logicmonitor",
 )
 
 
@@ -175,6 +182,11 @@ def _detect_input_type(path):
     if containerized_logs:
         return InputType.SOSREPORT, containerized_logs
 
+    # SOSReport (managed): logs/ directory with pod log files
+    managed_logs = _find_managed_sos_logs(path)
+    if managed_logs:
+        return InputType.SOSREPORT, managed_logs
+
     # must-gather: look for namespaces/ directory (OpenShift style)
     namespaces_dir = _find_namespaces_dir(path)
     if namespaces_dir is not None:
@@ -186,6 +198,39 @@ def _detect_input_type(path):
         return InputType.LOG_FILE, {"unknown": logs}
 
     return None, {}
+
+
+def _find_managed_sos_logs(base):
+    """Find nginx access logs in a managed-service SOSReport.
+
+    Managed sosreports place pod logs under ``logs/<namespace>/``, with
+    filenames like ``<pod-name>-nginx.log`` or
+    ``<pod-name>-<container-name>.log``.  Web container logs (e.g.
+    ``automation-controller-web``) contain nginx access lines mixed with
+    supervisor output; non-nginx lines are silently skipped during parsing.
+    """
+    logs_dir = os.path.join(base, "logs")
+    if not os.path.isdir(logs_dir):
+        return {}
+
+    component_logs = collections.defaultdict(list)
+    for root, _dirs, files in os.walk(logs_dir):
+        for fname in files:
+            lower = fname.lower()
+            if "error" in lower:
+                continue
+            # Nginx sidecar logs (e.g. *-nginx.log)
+            is_nginx = "nginx" in lower
+            # Web container logs (e.g. *-automation-controller-web.log)
+            is_web = lower.endswith("-web.log") or lower.endswith("-web.log.gz")
+            if is_nginx or is_web:
+                comp = _component_from_pod_name(fname)
+                if comp == "unknown" and not is_nginx:
+                    continue  # skip unrecognised web logs
+                full = os.path.join(root, fname)
+                component_logs[comp].append(full)
+
+    return dict(component_logs)
 
 
 def _find_namespaces_dir(base):
@@ -205,6 +250,9 @@ def _find_namespaces_dir(base):
 def _component_from_pod_name(pod_name):
     """Infer component name from a Kubernetes pod name."""
     pod_lower = pod_name.lower()
+    # Exclude nginx-ingress controller (not an AAP component)
+    if "ingress" in pod_lower:
+        return "unknown"
     if "controller" in pod_lower or "awx" in pod_lower or "tower" in pod_lower:
         return "controller"
     if "hub" in pod_lower or "galaxy" in pod_lower or "pulp" in pod_lower:
@@ -342,10 +390,27 @@ LogEntry = collections.namedtuple(
 
 
 def _open_log_file(path):
-    """Open a log file, handling gzip transparently."""
+    """Open a log file, handling gzip and JSON-array wrapping transparently."""
     if path.endswith(".gz"):
-        return gzip.open(path, "rt", errors="replace")
-    return io.open(path, "r", errors="replace")
+        fh = gzip.open(path, "rt", errors="replace")
+    else:
+        fh = io.open(path, "r", errors="replace")
+
+    content = fh.read()
+    fh.close()
+
+    # Detect JSON-array-wrapped logs (managed sosreports store log lines
+    # as a JSON array of strings).
+    stripped = content.lstrip()
+    if stripped.startswith("["):
+        try:
+            lines = json.loads(stripped)
+            if isinstance(lines, list):
+                return io.StringIO("\n".join(str(l) for l in lines) + "\n")
+        except (ValueError, TypeError):
+            pass
+
+    return io.StringIO(content)
 
 
 def _is_filtered(entry):
@@ -586,6 +651,7 @@ def print_summary(reports, errors, input_type, file=None):
             print("RESULT: No direct component access detected", file=file)
 
 
+
 def write_detailed_report(reports, output_path):
     """Write a detailed breakdown to a file."""
     with io.open(output_path, "w", encoding="utf-8") as fh:
@@ -663,7 +729,32 @@ def main(argv=None):
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
 
-    input_type, _ = _detect_input_type(input_path)
+    # If input is a tar archive, extract to a temp directory
+    tmp_dir = None
+    if os.path.isfile(input_path) and tarfile.is_tarfile(input_path):
+        print("Extracting archive: %s" % os.path.basename(input_path))
+        tmp_dir = tempfile.mkdtemp(prefix="aap-detect-")
+        with tarfile.open(input_path, "r:*") as tf:
+            tf.extractall(tmp_dir)
+        # Use single top-level dir if the archive has one (common for sosreports)
+        entries = os.listdir(tmp_dir)
+        if len(entries) == 1 and os.path.isdir(os.path.join(tmp_dir, entries[0])):
+            analysis_path = os.path.join(tmp_dir, entries[0])
+        else:
+            analysis_path = tmp_dir
+    else:
+        analysis_path = input_path
+
+    try:
+        return _run_analysis(args, input_path, analysis_path, output_dir)
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _run_analysis(args, input_path, analysis_path, output_dir):
+    """Core analysis logic, separated so tar cleanup can happen in main()."""
+    input_type, _ = _detect_input_type(analysis_path)
     if input_type is None:
         print("Error: could not detect input type for: %s" % input_path, file=sys.stderr)
         return 1
@@ -671,11 +762,11 @@ def main(argv=None):
     print("Detected input type: %s" % input_type)
     print("")
 
-    reports, errors = analyze(input_path, output_dir, args.include_filtered)
+    reports, errors = analyze(analysis_path, output_dir, args.include_filtered)
 
     print_summary(reports, errors, input_type)
 
-    # Write output files — named after the input
+    # Write output files — named after the original input
     input_basename = os.path.basename(input_path.rstrip(os.sep))
     # Strip common archive/log extensions to get a clean stem
     for ext in (".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".gz", ".log"):
