@@ -221,12 +221,16 @@ def _find_managed_sos_logs(base):
                 continue
             # Nginx sidecar logs (e.g. *-nginx.log)
             is_nginx = "nginx" in lower
-            # Web container logs (e.g. *-automation-controller-web.log)
-            is_web = lower.endswith("-web.log") or lower.endswith("-web.log.gz")
+            # Web container logs — match "-web-" anywhere in the name
+            # to handle both multi-container pods (container suffix:
+            # *-automation-controller-web.log) and single-container pods
+            # (pod name only: automation-hub-web-<k8s-suffix>.log)
+            is_web = "-web-" in lower or lower.endswith("-web.log") or lower.endswith("-web.log.gz")
             if is_nginx or is_web:
                 comp = _component_from_pod_name(fname)
-                if comp == "unknown" and not is_nginx:
-                    continue  # skip unrecognised web logs
+                if comp == "unknown":
+                    if "ingress" in lower or not is_nginx:
+                        continue  # skip non-AAP nginx-ingress and unrecognised web logs
                 full = os.path.join(root, fname)
                 component_logs[comp].append(full)
 
