@@ -229,7 +229,8 @@ def _find_managed_sos_logs(base):
             if is_nginx or is_web:
                 comp = _component_from_pod_name(fname)
                 if comp == "unknown":
-                    continue  # skip non-AAP logs (e.g. nginx-ingress)
+                    if "ingress" in lower or not is_nginx:
+                        continue  # skip non-AAP nginx-ingress and unrecognised web logs
                 full = os.path.join(root, fname)
                 component_logs[comp].append(full)
 
