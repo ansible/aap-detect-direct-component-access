@@ -24,6 +24,7 @@ from aap_detect_direct_component_access.detect import (
     _component_from_pod_name,
     _detect_input_type,
     _is_filtered,
+    _is_web_container,
     analyze,
     build_parser,
     main,
@@ -427,6 +428,71 @@ class TestInputDetection(unittest.TestCase):
         input_type, logs = _detect_input_type(self.tmpdir)
         self.assertEqual(input_type, InputType.MUST_GATHER)
         self.assertIn("eda", logs)
+
+    def test_must_gather_controller_web_container(self):
+        """AAP 2.6 controller pod with aap-controller-web container."""
+        ns_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "aap-controller-web-db4b45fb5-clf64",
+                              "aap-controller-web", "aap-controller-web",
+                              "logs")
+        os.makedirs(ns_dir)
+        with open(os.path.join(ns_dir, "current.log"), "w") as f:
+            f.write("test\n")
+        input_type, logs = _detect_input_type(self.tmpdir)
+        self.assertEqual(input_type, InputType.MUST_GATHER)
+        self.assertIn("controller", logs)
+
+    def test_must_gather_hub_web_container(self):
+        """AAP 2.6 hub pod with web container."""
+        ns_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "aap-hub-web-78c4cd9bb6-7245r",
+                              "web", "web", "logs")
+        os.makedirs(ns_dir)
+        with open(os.path.join(ns_dir, "current.log"), "w") as f:
+            f.write("test\n")
+        input_type, logs = _detect_input_type(self.tmpdir)
+        self.assertEqual(input_type, InputType.MUST_GATHER)
+        self.assertIn("hub", logs)
+
+    def test_must_gather_eda_nginx_container(self):
+        """EDA pod still uses nginx sidecar."""
+        ns_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "aap-eda-api-58c8d67ccf-ng7zg",
+                              "nginx", "nginx", "logs")
+        os.makedirs(ns_dir)
+        with open(os.path.join(ns_dir, "current.log"), "w") as f:
+            f.write("test\n")
+        input_type, logs = _detect_input_type(self.tmpdir)
+        self.assertEqual(input_type, InputType.MUST_GATHER)
+        self.assertIn("eda", logs)
+
+
+class TestWebContainerDetection(unittest.TestCase):
+    """Test _is_web_container helper."""
+
+    def test_nginx(self):
+        self.assertTrue(_is_web_container("nginx"))
+
+    def test_web(self):
+        self.assertTrue(_is_web_container("web"))
+
+    def test_controller_web(self):
+        self.assertTrue(_is_web_container("aap-controller-web"))
+
+    def test_hub_web(self):
+        self.assertTrue(_is_web_container("aap-hub-web"))
+
+    def test_eda_web(self):
+        self.assertTrue(_is_web_container("aap-eda-web"))
+
+    def test_redis_rejected(self):
+        self.assertFalse(_is_web_container("redis"))
+
+    def test_rsyslog_rejected(self):
+        self.assertFalse(_is_web_container("aap-controller-rsyslog"))
+
+    def test_eda_api_rejected(self):
+        self.assertFalse(_is_web_container("eda-api"))
 
 
 class TestGzipSupport(unittest.TestCase):
