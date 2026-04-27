@@ -344,40 +344,34 @@ def _is_web_container(container_name):
     return False
 
 
-def _find_pod_web_logs(pod_path):
-    """Return log file paths from web/nginx containers in a must-gather pod."""
-    results = []
-    for entry in os.listdir(pod_path):
-        if not _is_web_container(entry):
-            continue
-        # Standard must-gather: <container>/<container>/logs/
-        log_dir = os.path.join(pod_path, entry, entry, "logs")
-        if not os.path.isdir(log_dir):
-            # Flat structure fallback
-            log_dir = os.path.join(pod_path, entry)
-            if not os.path.isdir(log_dir):
-                continue
-        for root, _dirs, files in os.walk(log_dir):
-            for fname in files:
-                if fname.endswith(".log") or fname.endswith(".log.gz"):
-                    results.append(os.path.join(root, fname))
-    return results
-
-
 def _find_must_gather_logs(namespaces_dir):
-    """Find nginx/web access logs in an OpenShift must-gather."""
+    """Find nginx access logs in an OpenShift must-gather."""
     component_logs = collections.defaultdict(list)
     for ns_entry in os.listdir(namespaces_dir):
-        pods_dir = os.path.join(namespaces_dir, ns_entry, "pods")
+        ns_path = os.path.join(namespaces_dir, ns_entry)
+        pods_dir = os.path.join(ns_path, "pods")
         if not os.path.isdir(pods_dir):
             continue
         for pod_name in os.listdir(pods_dir):
             pod_path = os.path.join(pods_dir, pod_name)
             if not os.path.isdir(pod_path):
                 continue
-            comp = _component_from_pod_name(pod_name)
-            for log_path in _find_pod_web_logs(pod_path):
-                component_logs[comp].append(log_path)
+            for container in os.listdir(pod_path):
+                if not _is_web_container(container):
+                    continue
+                # Look for web/nginx container logs
+                log_dir = os.path.join(pod_path, container, container, "logs")
+                if not os.path.isdir(log_dir):
+                    # Also check flat structure
+                    log_dir = os.path.join(pod_path, container)
+                    if not os.path.isdir(log_dir):
+                        continue
+                for root, _dirs, files in os.walk(log_dir):
+                    for fname in files:
+                        if fname.endswith(".log") or fname.endswith(".log.gz"):
+                            full = os.path.join(root, fname)
+                            comp = _component_from_pod_name(pod_name)
+                            component_logs[comp].append(full)
     return dict(component_logs)
 
 
