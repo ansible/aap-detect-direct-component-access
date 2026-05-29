@@ -356,13 +356,18 @@ def _find_must_gather_logs(namespaces_dir):
             pod_path = os.path.join(pods_dir, pod_name)
             if not os.path.isdir(pod_path):
                 continue
+
+            # Track whether we found logs in standard container structure
+            found_standard_logs = False
+
+            # Standard structure: pods/<pod>/<container>/<container>/logs/
             for container in os.listdir(pod_path):
                 if not _is_web_container(container):
                     continue
                 # Look for web/nginx container logs
                 log_dir = os.path.join(pod_path, container, container, "logs")
                 if not os.path.isdir(log_dir):
-                    # Also check flat structure
+                    # Also check flat structure (some must-gathers use pod/container/ directly)
                     log_dir = os.path.join(pod_path, container)
                     if not os.path.isdir(log_dir):
                         continue
@@ -372,6 +377,23 @@ def _find_must_gather_logs(namespaces_dir):
                             full = os.path.join(root, fname)
                             comp = _component_from_pod_name(pod_name)
                             component_logs[comp].append(full)
+                            found_standard_logs = True
+
+            # Fallback: Flat structure for managed Azure must-gather
+            # pods/<pod>/logs/logs.txt with container delimiter headers
+            if not found_standard_logs:
+                flat_logs_dir = os.path.join(pod_path, "logs")
+                if os.path.isdir(flat_logs_dir):
+                    comp = _component_from_pod_name(pod_name)
+                    # Only process AAP component pods (skip unknown/redis/etc)
+                    if comp != "unknown":
+                        for fname in os.listdir(flat_logs_dir):
+                            # Accept .txt in addition to .log/.log.gz for flat structure
+                            if fname.endswith(".log") or fname.endswith(".log.gz") or fname.endswith(".txt"):
+                                full = os.path.join(flat_logs_dir, fname)
+                                component_logs[comp].append(full)
+                                # Note: delimiter filtering happens automatically in _open_log_file()
+
     return dict(component_logs)
 
 
@@ -388,6 +410,36 @@ def _find_nginx_logs_recursive(base):
 
 
 # ── Log parsing ─────────────────────────────────────────────────────
+
+
+def _filter_by_container_delimiter(file_handle):
+    """Filter a combined log file to only yield lines from web containers.
+
+    Recognizes delimiter headers of the form:
+        ==== START logs for container <container_name> of pod <pod_name> ====
+
+    Only includes lines from sections where container_name passes _is_web_container().
+    Lines before the first delimiter are included (orphaned lines).
+    """
+    current_container = None
+    filtered_lines = []
+
+    for line in file_handle:
+        # Check for container delimiter header
+        if line.startswith("==== START logs for container "):
+            # Extract container name
+            # Format: "==== START logs for container <name> of pod <pod> ===="
+            match = re.search(r'==== START logs for container (\S+) of pod', line)
+            if match:
+                current_container = match.group(1)
+            continue  # Skip delimiter line itself
+
+        # Include lines from web containers OR orphan lines before first delimiter
+        if current_container is None or _is_web_container(current_container):
+            filtered_lines.append(line)
+
+    return io.StringIO("".join(filtered_lines))
+
 
 LogEntry = collections.namedtuple(
     "LogEntry",
@@ -409,7 +461,7 @@ LogEntry = collections.namedtuple(
 
 
 def _open_log_file(path):
-    """Open a log file, handling gzip and JSON-array wrapping transparently."""
+    """Open a log file, handling gzip, JSON-array wrapping, and container delimiters."""
     if path.endswith(".gz"):
         fh = gzip.open(path, "rt", errors="replace")
     else:
@@ -425,9 +477,13 @@ def _open_log_file(path):
         try:
             lines = json.loads(stripped)
             if isinstance(lines, list):
-                return io.StringIO("\n".join(str(l) for l in lines) + "\n")
+                content = "\n".join(str(l) for l in lines) + "\n"
         except (ValueError, TypeError):
             pass
+
+    # Detect and filter container delimiter format (managed Azure must-gather)
+    if "==== START logs for container " in content:
+        return _filter_by_container_delimiter(io.StringIO(content))
 
     return io.StringIO(content)
 
