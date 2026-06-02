@@ -466,6 +466,138 @@ class TestInputDetection(unittest.TestCase):
         self.assertEqual(input_type, InputType.MUST_GATHER)
         self.assertIn("eda", logs)
 
+    def test_must_gather_managed_azure_flat_structure_controller(self):
+        """Managed Azure must-gather with flat logs/ and container delimiters."""
+        # Structure: pods/automation-controller-web-<hash>/logs/logs.txt
+        pod_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "automation-controller-web-db4b45fb5-clf64")
+        logs_dir = os.path.join(pod_dir, "logs")
+        os.makedirs(logs_dir)
+
+        # Multi-container log with delimiters (rsyslog, web, redis)
+        log_content = """==== START logs for container automation-controller-rsyslog of pod automation-controller-web-db4b45fb5-clf64 ====
+May 29 10:00:01 rsyslog[123]: some rsyslog output
+==== START logs for container automation-controller-web of pod automation-controller-web-db4b45fb5-clf64 ====
+10.0.0.1 - - [29/May/2026:10:00:01 +0000] "GET /api/v2/jobs/ HTTP/1.1" 200 1234 "-" "curl/7.68.0" "-" - -
+10.0.0.2 - - [29/May/2026:10:00:02 +0000] "GET /api/v2/ping/ HTTP/1.1" 200 45 "-" "kube-probe/1.27" "-" - -
+==== START logs for container redis of pod automation-controller-web-db4b45fb5-clf64 ====
+1:M 29 May 2026 10:00:01.123 # Server initialized
+"""
+
+        with open(os.path.join(logs_dir, "logs.txt"), "w") as f:
+            f.write(log_content)
+
+        input_type, logs = _detect_input_type(self.tmpdir)
+        self.assertEqual(input_type, InputType.MUST_GATHER)
+        self.assertIn("controller", logs)
+
+        # Verify only web container lines are parsed
+        reports, errors = analyze(self.tmpdir)
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(len(reports), 1)
+        report = reports[0]
+        self.assertEqual(report.name, "controller")
+        self.assertEqual(report.total_requests, 2)  # Only nginx lines from web container
+        self.assertEqual(report.direct_access_count, 1)  # GET /api/v2/jobs/ (not ping)
+        self.assertEqual(report.filtered_count, 1)  # kube-probe line filtered
+
+    def test_must_gather_flat_orphan_lines_before_delimiter(self):
+        """Lines before first delimiter should be included."""
+        pod_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "automation-hub-web-abc")
+        logs_dir = os.path.join(pod_dir, "logs")
+        os.makedirs(logs_dir)
+
+        # Log lines before first delimiter (orphans)
+        log_content = """10.0.0.9 - - [29/May/2026:09:59:59 +0000] "GET /api/galaxy/ HTTP/1.1" 200 100 "-" "curl/7.68.0" "-" - -
+==== START logs for container web of pod automation-hub-web-abc ====
+10.0.0.1 - - [29/May/2026:10:00:01 +0000] "GET /api/galaxy/ HTTP/1.1" 200 1234 "-" "curl/7.68.0" "-" - -
+"""
+
+        with open(os.path.join(logs_dir, "logs.txt"), "w") as f:
+            f.write(log_content)
+
+        reports, errors = analyze(self.tmpdir)
+        self.assertEqual(len(errors), 0)
+        report = reports[0]
+        # Should include both orphan line and web container line
+        self.assertEqual(report.total_requests, 2)
+        self.assertEqual(report.direct_access_count, 2)
+
+    def test_must_gather_standard_structure_not_affected(self):
+        """Ensure flat-structure fallback doesn't break standard must-gathers."""
+        # Create standard structure with web container
+        ns_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "aap-hub-web-78c4cd9bb6-7245r",
+                              "web", "web", "logs")
+        os.makedirs(ns_dir)
+
+        with open(os.path.join(ns_dir, "current.log"), "w") as f:
+            f.write('10.0.0.1 - - [29/May/2026:10:00:01 +0000] "GET /api/galaxy/ HTTP/1.1" 200 1234 "-" "curl/7.68.0" "-" - -\n')
+
+        # Also create a logs/ directory with a .txt file to ensure it's not picked up
+        logs_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                               "aap-hub-web-78c4cd9bb6-7245r", "logs")
+        os.makedirs(logs_dir)
+        with open(os.path.join(logs_dir, "unrelated.txt"), "w") as f:
+            f.write("This should not be processed\n")
+
+        input_type, logs = _detect_input_type(self.tmpdir)
+        self.assertEqual(input_type, InputType.MUST_GATHER)
+        self.assertIn("hub", logs)
+        # Should have found exactly 1 log file (current.log), not unrelated.txt
+        self.assertEqual(len(logs["hub"]), 1)
+        self.assertTrue(logs["hub"][0].endswith("current.log"))
+
+    def test_must_gather_flat_no_delimiters(self):
+        """Flat structure .txt file without delimiters should work as before."""
+        pod_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "automation-controller-web-abc")
+        logs_dir = os.path.join(pod_dir, "logs")
+        os.makedirs(logs_dir)
+
+        # Plain nginx log without container delimiters
+        log_content = """10.0.0.1 - - [29/May/2026:10:00:01 +0000] "GET /api/v2/jobs/ HTTP/1.1" 200 1234 "-" "curl/7.68.0" "-" - -
+10.0.0.2 - - [29/May/2026:10:00:02 +0000] "GET /api/v2/ping/ HTTP/1.1" 200 45 "-" "kube-probe/1.27" "-" - -
+"""
+
+        with open(os.path.join(logs_dir, "access.log"), "w") as f:
+            f.write(log_content)
+
+        reports, errors = analyze(self.tmpdir)
+        self.assertEqual(len(errors), 0)
+        report = reports[0]
+        # Should work normally - both lines parsed
+        self.assertEqual(report.total_requests, 2)
+        self.assertEqual(report.direct_access_count, 1)
+        self.assertEqual(report.filtered_count, 1)
+
+    def test_must_gather_flat_multiple_web_containers(self):
+        """Flat structure with multiple web containers in one combined file."""
+        pod_dir = os.path.join(self.tmpdir, "namespaces", "aap", "pods",
+                              "automation-controller-web-abc")
+        logs_dir = os.path.join(pod_dir, "logs")
+        os.makedirs(logs_dir)
+
+        # Multiple web containers (nginx and controller-web)
+        log_content = """==== START logs for container nginx of pod automation-controller-web-abc ====
+10.0.0.1 - - [29/May/2026:10:00:01 +0000] "GET /api/v2/jobs/ HTTP/1.1" 200 1234 "-" "curl/7.68.0" "-" - -
+==== START logs for container automation-controller-web of pod automation-controller-web-abc ====
+10.0.0.2 - - [29/May/2026:10:00:02 +0000] "POST /api/v2/tokens/ HTTP/1.1" 201 567 "-" "curl/7.68.0" "-" - -
+==== START logs for container redis of pod automation-controller-web-abc ====
+redis log output
+"""
+
+        with open(os.path.join(logs_dir, "logs.txt"), "w") as f:
+            f.write(log_content)
+
+        reports, errors = analyze(self.tmpdir)
+        self.assertEqual(len(errors), 0)
+        report = reports[0]
+        # Should include lines from both nginx and controller-web containers
+        self.assertEqual(report.total_requests, 2)
+        self.assertEqual(report.direct_access_count, 2)
+
 
 class TestWebContainerDetection(unittest.TestCase):
     """Test _is_web_container helper."""
